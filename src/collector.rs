@@ -4,15 +4,13 @@ use std::collections::hash_map::DefaultHasher;
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::frames::UnresolvedFrames;
 
-use tempfile::NamedTempFile;
-
 pub const BUCKETS: usize = 1 << 12;
 pub const BUCKETS_ASSOCIATIVITY: usize = 4;
-pub const BUFFER_LENGTH: usize = (1 << 18) / std::mem::size_of::<Entry<UnresolvedFrames>>();
+pub const CAPACITY: usize =
+    (1 * 1024 * 1024 * 1024) / std::mem::size_of::<Entry<UnresolvedFrames>>();
 
 #[derive(Debug)]
 pub struct Entry<T> {
@@ -144,105 +142,22 @@ impl<T: Hash + Eq> HashCounter<T> {
     }
 }
 
-pub struct TempFdArray<T: 'static> {
-    file: NamedTempFile,
-    buffer: Box<[T; BUFFER_LENGTH]>,
-    buffer_index: usize,
-}
-
-impl<T: Default + Debug> TempFdArray<T> {
-    fn new() -> std::io::Result<TempFdArray<T>> {
-        let file = NamedTempFile::new()?;
-
-        let mut v: Vec<T> = Vec::with_capacity(BUFFER_LENGTH);
-        v.resize_with(BUFFER_LENGTH, Default::default);
-        let buffer = v.into_boxed_slice().try_into().unwrap();
-
-        Ok(Self {
-            file,
-            buffer,
-            buffer_index: 0,
-        })
-    }
-}
-
-impl<T> TempFdArray<T> {
-    fn flush_buffer(&mut self) -> std::io::Result<()> {
-        self.buffer_index = 0;
-        let buf = unsafe {
-            std::slice::from_raw_parts(
-                self.buffer.as_ptr() as *const u8,
-                BUFFER_LENGTH * std::mem::size_of::<T>(),
-            )
-        };
-        self.file.write_all(buf)?;
-
-        Ok(())
-    }
-
-    fn push(&mut self, entry: T) -> std::io::Result<()> {
-        if self.buffer_index >= BUFFER_LENGTH {
-            self.flush_buffer()?;
-        }
-
-        self.buffer[self.buffer_index] = entry;
-        self.buffer_index += 1;
-
-        Ok(())
-    }
-
-    fn try_iter(&self) -> std::io::Result<impl Iterator<Item = &T>> {
-        let mut file_vec = Vec::new();
-        let mut file = self.file.reopen()?;
-        file.seek(SeekFrom::Start(0))?;
-        file.read_to_end(&mut file_vec)?;
-        file.seek(SeekFrom::End(0))?;
-
-        Ok(TempFdArrayIterator {
-            buffer: &self.buffer[0..self.buffer_index],
-            file_vec,
-            index: 0,
-        })
-    }
-}
-
-pub struct TempFdArrayIterator<'a, T> {
-    pub buffer: &'a [T],
-    pub file_vec: Vec<u8>,
-    pub index: usize,
-}
-
-impl<'a, T> Iterator for TempFdArrayIterator<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.buffer.len() {
-            self.index += 1;
-            Some(&self.buffer[self.index - 1])
-        } else {
-            let length = self.file_vec.len() / std::mem::size_of::<T>();
-            let ts =
-                unsafe { std::slice::from_raw_parts(self.file_vec.as_ptr() as *const T, length) };
-            if self.index - self.buffer.len() < ts.len() {
-                self.index += 1;
-                Some(&ts[self.index - self.buffer.len() - 1])
-            } else {
-                None
-            }
-        }
-    }
-}
-
 pub struct Collector<T: Hash + Eq + 'static> {
     map: HashCounter<T>,
-    temp_array: TempFdArray<Entry<T>>,
+    temp_array: Vec<Entry<T>>,
+}
+
+impl<T: Hash + Eq + 'static> Collector<T> {
+    pub fn iter(&self) -> impl Iterator<Item = &Entry<T>> {
+        self.map.iter().chain(self.temp_array.iter())
+    }
 }
 
 impl<T: Hash + Eq + Default + Debug + 'static> Collector<T> {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             map: HashCounter::<T>::default(),
-            temp_array: TempFdArray::<Entry<T>>::new()?,
+            temp_array: Vec::with_capacity(CAPACITY),
         })
     }
 }
@@ -250,14 +165,15 @@ impl<T: Hash + Eq + Default + Debug + 'static> Collector<T> {
 impl<T: Hash + Eq + 'static> Collector<T> {
     pub fn add(&mut self, key: T, count: isize) -> std::io::Result<()> {
         if let Some(evict) = self.map.add(key, count) {
-            self.temp_array.push(evict)?;
+            if self.temp_array.len() == CAPACITY {
+                // REASON: We have to avoid allocating inside of a signal
+                // handler.
+                panic!("Exceeded collector capacity");
+            }
+            self.temp_array.push(evict);
         }
 
         Ok(())
-    }
-
-    pub fn try_iter(&self) -> std::io::Result<impl Iterator<Item = &Entry<T>>> {
-        Ok(self.map.iter().chain(self.temp_array.try_iter()?))
     }
 }
 
@@ -343,7 +259,7 @@ mod tests {
             }
         }
 
-        collector.try_iter().unwrap().for_each(|entry| {
+        collector.iter().for_each(|entry| {
             test_utils::add_map(&mut real_map, entry);
         });
 
@@ -358,5 +274,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn collector_alignment_test() {
+        let a: u16 = 1; // aligned to 2 bytes
+        let mut c = Collector::new().unwrap();
+        let _ = c.add(a, 4isize);
+        let _ = c.add(3, 4isize);
+        c.iter().for_each(|entry| {
+            println!("{:?}", entry);
+        });
     }
 }

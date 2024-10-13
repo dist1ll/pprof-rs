@@ -89,7 +89,13 @@ pub fn validate(addr: *const libc::c_void) -> bool {
     }
 
     let write_fd = MEM_VALIDATE_PIPE.write_fd.load(Ordering::SeqCst);
+    
+    if addr.is_null() || !addr.is_aligned() {
+        return false;
+    }
+    
     loop {
+        // SAFETY: We do a null and alignment check before this line.
         let buf = unsafe { std::slice::from_raw_parts(addr as *const u8, CHECK_LENGTH) };
 
         match write(write_fd, buf) {

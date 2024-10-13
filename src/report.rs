@@ -69,7 +69,7 @@ impl<'a> ReportBuilder<'a> {
                 Err(Error::CreatingError)
             }
             Ok(profiler) => {
-                profiler.data.try_iter()?.for_each(|entry| {
+                profiler.data.iter().for_each(|entry| {
                     let count = entry.count;
                     if count > 0 {
                         let key = &entry.item;
@@ -107,7 +107,7 @@ impl<'a> ReportBuilder<'a> {
                 Err(Error::CreatingError)
             }
             Ok(profiler) => {
-                profiler.data.try_iter()?.for_each(|entry| {
+                profiler.data.iter().for_each(|entry| {
                     let count = entry.count;
                     if count > 0 {
                         let mut key = Frames::from(entry.item.clone());
